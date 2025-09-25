@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Controlled Music</title>
+<style>
+body {
+  margin:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  height:100vh; background:#111; color:white; font-family:sans-serif; overflow:hidden;
+  transition: filter 0.1s linear;
+}
+button { padding:10px 20px; font-size:16px; margin-bottom:10px; cursor:pointer; }
+#cam { width:480px; height:360px; border:2px solid #444; background:black; }
+#canvas { position:absolute; top:0; left:0; }
+#volumeBar { position:absolute; left:10px; bottom:20px; width:20px; height:300px; background:#333; border-radius:5px; }
+#volumeFill { width:100%; height:0%; background:#7be4a6; border-radius:5px; }
+#brightnessBar { position:absolute; right:10px; bottom:20px; width:20px; height:300px; background:#333; border-radius:5px; }
+#brightnessFill { width:100%; height:0%; background:#f7d96f; border-radius:5px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7"></script>
+</head>
+<body>
+<button id="startBtn">Start</button>
+<video id="cam" autoplay playsinline></video>
+<canvas id="canvas" width="480" height="360"></canvas>
+
+<!-- Volume bar (left) -->
+<div id="volumeBar"><div id="volumeFill"></div></div>
+
+<!-- Brightness bar (right) -->
+<div id="brightnessBar"><div id="brightnessFill"></div></div>
+
+<video id="music" src="scatterbg.webm" loop></video>
+
+<script>
+// Selects the <video> element with id="cam" from the HTML.
+// This is the webcam feed (what the user’s camera shows).
+const video = document.getElementById('cam');  
+
+// Selects the <canvas> element with id="canvas".
+// The canvas is where we will *draw* the detected hand landmarks (dots on fingers, wrist, etc.).
+const canvas = document.getElementById('canvas');  
+
+// Gets the "2D drawing context" from the canvas.
+// ctx is like the "paintbrush" we use to draw circles, lines, shapes on the canvas.
+const ctx = canvas.getContext('2d');  
+
+// Selects the <button> element with id="startBtn".
+// This button is used to start the whole hand-tracking system (camera + AI model).
+const startBtn = document.getElementById('startBtn');  
+
+// Selects the <video> element with id="music" from the HTML.
+// This is not a webcam feed. Instead, this <video> is like a background music/video file
+// that will be controlled by your hand gestures (volume, play/pause).
+const music = document.getElementById('music');  
+
+// Selects the inner <div> with id="volumeFill" inside the volume bar.
+// We'll change its height dynamically to *show how much volume* is currently set.
+const volumeFill = document.getElementById('volumeFill');  
+
+// Selects the inner <div> with id="brightnessFill" inside the brightness bar.
+// We'll change its height dynamically to *show how much brightness* is currently set.
+const brightnessFill = document.getElementById('brightnessFill');  
+
+
+let model;
+const PINCH_THRESHOLD = 50; // distance in pixels (thumb ↔ index) for pinch
+// setup webcam
+async function setupCamera(){
+  // 1. Ask the browser for access to the user's camera
+  // navigator.mediaDevices.getUserMedia() → built-in browser API
+  // We pass { video: true } to request *video only* (no microphone)
+  // It returns a Promise that resolves with a MediaStream object
+
+  const stream = await navigator.mediaDevices.getUserMedia({video:true});
+
+  // 2. Assign the video stream to the <video> element
+  // video.srcObject is how we "feed" the live webcam stream into the <video> tag
+  // Example: <video id="cam"></video> will now show the webcam feed
+  video.srcObject = stream;
+
+  // 3. Wait until the video metadata (like width, height, duration) is ready
+  // video.onloadedmetadata fires once the browser knows the video dimensions
+  // We return a Promise that resolves when this happens
+  // Why? → Because we must ensure the camera is fully initialized
+  // before we start using its dimensions (e.g., in getYNorm, handpose, etc.)  
+  return new Promise(res => video.onloadedmetadata = res);
+}
+
+// Function to draw the detected hand landmarks (joints) on the canvas
+function drawHand(hand, color){
+
+  // hand.landmarks is an array of 21 points (x, y, z) for each keypoint of the hand
+  // Example: thumb tip, index tip, wrist, etc.
+  // Structure looks like:
+  // hand.landmarks = [
+  //   [x0, y0, z0],  // wrist
+  //   [x1, y1, z1],  // thumb base
+  //   [x2, y2, z2],  // thumb joint
+  //   ...
+  //   [x20, y20, z20] // pinky tip
+  // ]
+
+  // forEach → loop through each point in landmarks
+  // Here we use array destructuring: ([x,y]) means
+  // we only take the x and y values (ignore z for 2D drawing).
+
+  hand.landmarks.forEach(([x,y])=>{
+    //set drawing colour
+    ctx.fillStyle = color;
+    // Start a new path for drawing
+    ctx.beginPath();
+
+    // Draw a circle (arc) at the landmark position
+    // ctx.arc(x, y, radius, startAngle, endAngle)
+    // radius = 5 → small dot
+    // 0 → start at 0 radians
+    // Math.PI*2 → full circle (360°)
+    ctx.arc(x,y,5,0,Math.PI*2);
+    //fill the ciricle with chosen colour
+    ctx.fill();
+  });
+}
+
+// Function to normalize a point's Y-coordinate (vertical position)
+// so that it's always between 0 and 1, regardless of video size.
+function getYNorm(point){
+  //point is [x, y, z] → we only care about y
+  //video.videoHeight gives the total height of the webcam feed
+  //Dividing y by videoHeight converts it into a ratio:
+  //- At the very top of the video → y is small (close to 0) → ratio ≈ 0
+  //- At the bottom of the video → y is large (close to videoHeight) → ratio ≈ 1
+
+  return point[1]/video.videoHeight;
+}
+
+// main loop
+// Main function: runs the whole hand tracking + control system
+async function run() {
+  // 1. Setup webcam and wait until it's ready
+  await setupCamera();
+
+  // 2. Load the TensorFlow Handpose model
+  model = await handpose.load();
+
+  // 3. Define an inner function (frame) → this runs for every video frame
+  async function frame() {
+    // Clear the canvas before drawing new hand points
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 4. Detect hands in the current video frame
+    const predictions = await model.estimateHands(video);
+    // predictions is an array of detected hands (each has 21 landmarks)
+
+    // 5. For each detected hand:
+    predictions.forEach((hand) => {
+      // Extract important points from landmarks
+      const wrist = hand.landmarks[0];     // wrist landmark
+      const thumbTip = hand.landmarks[4];  // thumb tip
+      const indexTip = hand.landmarks[8];  // index tip
+
+      // 6. Calculate pinch distance (distance between thumb tip & index tip)
+      const pinchDist = Math.hypot(
+        thumbTip[0] - indexTip[0], 
+        thumbTip[1] - indexTip[1]
+      );
+      const isClosed = pinchDist < PINCH_THRESHOLD; // pinch = fingers close
+
+      // 7. Decide if this is LEFT or RIGHT hand
+      // Rule: if wrist X < half video width → Left hand, else → Right hand
+      if (wrist[0] < video.videoWidth / 2) {
+        // ---------- LEFT HAND → Controls Volume ----------
+
+        // Convert wrist Y position into normalized 0..1 value (top=1, bottom=0)
+        const volume = 1 - getYNorm(wrist);
+
+        // Clamp volume between 0 and 1
+        music.volume = Math.min(Math.max(volume, 0), 1);
+
+        // Update the green volume bar (visual feedback)
+        volumeFill.style.height = `${volume * 100}%`;
+
+        // Pinch gesture = toggle play/pause
+        if (isClosed && music.paused) music.play();   // pinch when paused → play
+        if (!isClosed && !music.paused) music.pause(); // release → pause
+
+        // Draw hand landmarks in green
+        drawHand(hand, 'lime');
+      } 
+      else {
+        // ---------- RIGHT HAND → Controls Brightness ----------
+
+        // Formula: 0.5 base + (hand higher → more brightness)
+        let bright = 0.5 + (1 - getYNorm(wrist)) * 1.5;
+
+        // Clamp brightness between 0.5 (darker) and 2 (super bright)
+        bright = Math.min(Math.max(bright, 0.5), 2);
+
+        // Apply brightness filter to entire page
+        document.body.style.filter = `brightness(${bright})`;
+
+        // Update the yellow brightness bar
+        const brightPercent = ((bright - 0.5) / 1.5) * 100;
+        brightnessFill.style.height = `${brightPercent}%`;
+
+        // Draw hand landmarks in cyan
+        drawHand(hand, 'cyan');
+      }
+    });
+
+    // 8. Loop again on the next animation frame
+    requestAnimationFrame(frame);
+  }
+
+  // Start the first frame
+  frame();
+}
+
+// Event listener: when Start button is clicked
+startBtn.addEventListener('click', async () => {
+  startBtn.disabled = true; // disable button (no multiple starts)
+  await run();              // start the system
+});
+
+</script>
+</body>
+</html>
